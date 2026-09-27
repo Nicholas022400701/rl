@@ -1567,6 +1567,67 @@ class TestGRPOLossRefactorBehavior:
         torch.testing.assert_close(out.kl_to_ref, expected_kl)
         torch.testing.assert_close(out.loss_kl_to_ref, kl_coeff * expected_kl)
 
+    @pytest.mark.parametrize("aggregation", ["token_mean", "prompt_mean"])
+    def test_kl_to_ref_is_aggregated_over_valid_tokens(self, aggregation):
+        """The KL penalty follows the loss aggregation over the valid tokens.
+
+        Before the fix the k3 estimate was averaged over the padded [B, T] tensor
+        with the masked positions set to 0, so the penalty (and the logged
+        kl_approx) was scaled by the fraction of valid tokens in the batch and
+        changed with the amount of padding.
+        """
+        cur_lp = torch.tensor([[-1.0, -2.0, -0.5], [-0.2, -1.5, -3.0]])
+        ref_lp = torch.tensor([[-1.5, -1.0, -0.5], [-0.4, -1.0, -2.0]])
+        mask = torch.tensor([[False, True, True], [True, True, True]])
+        diff = ref_lp - cur_lp
+        kl_token = diff.expm1() - diff
+        if aggregation == "token_mean":
+            expected_kl = kl_token[mask].mean()
+        else:
+            expected_kl = (
+                (kl_token * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True)
+            ).mean(0)
+
+        def make_data(cur_lp, ref_lp, mask):
+            batch, seq = cur_lp.shape
+            return TensorDict(
+                {
+                    "current_log_prob": cur_lp,
+                    "mask": mask,
+                    ("tokens", "full"): torch.zeros(batch, seq, dtype=torch.long),
+                    ("log_probs", "full"): cur_lp + 0.1,
+                    "advantage": torch.ones(batch, seq, 1),
+                    ("next", "ref_log_probs", "full"): ref_lp,
+                },
+                batch_size=[batch],
+            )
+
+        kl_coeff = 0.5
+        loss_fn = GRPOLoss(
+            _FixedLogProbPolicy(),
+            clip_epsilon=0.2,
+            entropy_bonus=False,
+            kl_to_ref_coeff=kl_coeff,
+            aggregation=aggregation,
+        )
+        out = loss_fn(make_data(cur_lp, ref_lp, mask))
+        torch.testing.assert_close(out.kl_to_ref, expected_kl)
+        torch.testing.assert_close(out.loss_kl_to_ref, kl_coeff * expected_kl)
+        torch.testing.assert_close(out.kl_approx, torch.tensor(0.1))
+
+        # The same tokens with more left padding give the same penalty.
+        pad = torch.zeros(2, 4)
+        pad_mask = torch.zeros(2, 4, dtype=torch.bool)
+        out_padded = loss_fn(
+            make_data(
+                torch.cat([pad, cur_lp], -1),
+                torch.cat([pad, ref_lp], -1),
+                torch.cat([pad_mask, mask], -1),
+            )
+        )
+        torch.testing.assert_close(out_padded.kl_to_ref, expected_kl)
+        torch.testing.assert_close(out_padded.kl_approx, torch.tensor(0.1))
+
     def test_dapo_can_be_instantiated_with_actor_network(self):
         """Before the fix, DAPO.__init__ took tensordict as its first positional
         argument (a copy-paste of _kl_to_ref body). Calling

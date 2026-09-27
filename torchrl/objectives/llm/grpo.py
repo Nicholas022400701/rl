@@ -723,7 +723,9 @@ class GRPOLoss(LossModule):
         )
         td_out = TensorDict({"loss_objective": loss_objective})
         td_out.set("clip_fraction", clip_fraction)
-        td_out.set("kl_approx", kl_approx.detach().mean())  # for logging
+        td_out.set(
+            "kl_approx", kl_approx.detach()[expand_as_right(mask, kl_approx)].mean()
+        )  # for logging
 
         if self.entropy_bonus:
             entropy = self._get_entropy(dist, adv_shape=advantage.shape[:-1])
@@ -912,7 +914,15 @@ class GRPOLoss(LossModule):
                 expand_as_right(mask, cur_log_prob), cur_log_prob, 0.0
             )
         diff = ref_log_prob - cur_log_prob
-        kl_penalty = (diff.expm1() - diff).mean()
+        kl_token = diff.expm1() - diff
+        if mask is None:
+            kl_penalty = kl_token.mean()
+        else:
+            # Aggregate over the valid tokens like the other loss terms. A mean over the padded
+            # tensor would scale the penalty by the fraction of valid tokens in the batch.
+            kl_penalty = self._aggregate_loss_value(
+                kl_token.unsqueeze(-1), mask, tensordict=tensordict
+            )
         return coeff * kl_penalty, kl_penalty
 
     def _log_weight(
