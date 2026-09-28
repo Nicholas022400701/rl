@@ -577,14 +577,18 @@ class VecNormV2(Transform):
                 return data
 
         if self.decay < 1.0:
-            bias_correction = 1 - (count * math.log(self.decay)).exp()
+            # -expm1(count * log(decay)) is 1 - decay**count without the cancellation of 1 - exp(x)
+            bias_correction = -(count * math.log(self.decay)).expm1()
             bias_correction = bias_correction.apply(lambda x, y: x.to(y.dtype), data)
         else:
             bias_correction = 1
 
-        var = var - loc.pow(2)
+        # loc and var are exponential moving averages of x and x^2 that start from zero, so both must be
+        # bias-corrected before the variance is formed: var/bc - (loc/bc)^2, not (var - loc^2)/bc.
         loc = loc / bias_correction
         var = var / bias_correction
+        # rounding can leave a tiny negative variance, which sqrt would turn into nan
+        var = (var - loc.pow(2)).clamp_min(0)
 
         scale = var.sqrt().clamp_min(self.eps)
 
@@ -849,16 +853,16 @@ class VecNormV2(Transform):
             loc = self._loc
             count = self._count
             if self.decay != 1.0:
-                bias_correction = 1 - (count * math.log(self.decay)).exp()
+                bias_correction = -(count * math.log(self.decay)).expm1()
                 bias_correction = bias_correction.apply(lambda x, y: x.to(y.dtype), loc)
             else:
                 bias_correction = 1
             if loc_only:
                 return loc / bias_correction, None
             var = self._var
-            var = var - loc.pow(2)
             loc = loc / bias_correction
             var = var / bias_correction
+            var = (var - loc.pow(2)).clamp_min(0)
             scale = var.sqrt().clamp_min(self.eps)
             return loc, scale
         else:

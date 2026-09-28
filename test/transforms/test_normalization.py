@@ -121,6 +121,54 @@ class TestVecNormV2:
             assert env.transform._loc.ndim == 0
             assert env.transform._var.ndim == 0
 
+    @pytest.mark.parametrize("stateful", [True, False])
+    def test_vecnorm2_decay_bias_correction(self, stateful):
+        # The running stats are exponential moving averages of x and x^2 that start from zero. Both have
+        # to be bias-corrected before the variance is formed, otherwise an observation with a large offset
+        # is normalized by sqrt(E[x^2]) ~ |mean| instead of by its standard deviation.
+        offset = 100.0
+
+        class OffsetEnv(self.SimpleEnv):
+            def _reset(self, tensordict, **kwargs):
+                tensordict = super()._reset(tensordict, **kwargs)
+                tensordict["observation"] = tensordict["observation"] + offset
+                return tensordict
+
+            def _step(self, tensordict):
+                tensordict = super()._step(tensordict)
+                tensordict["observation"] = tensordict["observation"] + offset
+                return tensordict
+
+        torch.manual_seed(0)
+        env = OffsetEnv().append_transform(
+            VecNormV2(
+                in_keys=["observation"],
+                out_keys=["obs_norm"],
+                decay=0.9999,
+                stateful=stateful,
+            )
+        )
+        rollout = env.rollout(50, break_when_any_done=False)
+        obs = rollout["next", "observation"]
+        # once the running mean has settled, the normalized observations have unit spread
+        obs_norm = rollout["next", "obs_norm"][-25:]
+        assert 0.5 < obs_norm.std() < 2.0, obs_norm.std()
+        if stateful:
+            torch.testing.assert_close(
+                env.transform.loc["observation"], obs.mean(), atol=0.05, rtol=0
+            )
+            torch.testing.assert_close(
+                env.transform.scale["observation"],
+                obs.std(unbiased=False),
+                atol=0.05,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                rollout[-1]["next", "obs_norm"],
+                (obs[-1] - env.transform.loc["observation"])
+                / env.transform.scale["observation"],
+            )
+
     @pytest.mark.skipif(not _has_gym, reason="gym not available")
     @pytest.mark.parametrize("stateful", [True, False])
     def test_stateful_and_stateless_specs(self, stateful):
